@@ -1,4 +1,10 @@
+# HTTP client with a Chrome TLS fingerprint (gets past Cloudflare with captured cookies)
 curl-cffi>=0.7.1
+# Coloured terminal output
 colorama>=0.4.6
+# Undetected Chrome, used to solve the Cloudflare challenge automatically
 nodriver>=0.50.0
+# Optional: converts WebP thumbnails to JPEG cover art (falls back to ffmpeg if missing)
 Pillow>=10.0.0
+
+# Also required (not pip-installable): ffmpeg on PATH, and Google Chrome for nodriver

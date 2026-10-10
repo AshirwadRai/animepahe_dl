@@ -1,14 +1,15 @@
 """
-kwik.py  —  Stream URL extractor for kwik.cx
+kwik.py  —  Stream URL extractor for kwik embeds (kwik.cx / kwik.si).
 
-kwik.cx embeds the m3u8 stream URL inside a packed/obfuscated JavaScript eval.
-This module fetches the embed page and unpacks the JS to extract the URL.
+animepahe doesn't host video itself; each quality option is a kwik embed page
+that hides the m3u8 stream URL inside packed/obfuscated JavaScript
+(Dean Edwards' eval(function(p,a,c,k,e,d){...}) packer).
 
-Flow:
-  1. GET  kwik.cx/e/<id>    (with Referer: animepahe domain)
-  2. Find the eval(function(p,a,c,k,e,d)...) packed JS
-  3. Unpack it to reveal the m3u8 URL
-  4. Return the URL directly — no POST needed anymore
+Flow (get_stream_url):
+  1. GET the embed page, with animepahe as Referer (kwik rejects others)
+  2. Look for a plain m3u8 URL in the HTML
+  3. Otherwise unpack every packed JS payload and search those
+  4. Fall back to the legacy form-POST flow used by older kwik pages
 """
 
 import re
@@ -145,6 +146,6 @@ def get_stream_url(kwik_url: str) -> str | None:
 
     print(Fore.RED + "[kwik] m3u8 URL not found in response" + Fore.RESET)
     print(Fore.YELLOW +
-          "[kwik] tip: kwik layout may have changed — inspect the page manually\n"
+          "[kwik] tip: kwik layout may have changed - inspect the page manually\n"
           "            and update the regex in kwik.py" + Fore.RESET)
     return None

@@ -1,16 +1,21 @@
 """
-scraper.py
+scraper.py  —  animepahe API client, session management and HLS downloader.
 
-Cloudflare on animepahe uses IUAM/Turnstile (real browser fingerprint check).
-This cannot be bypassed with plain requests or cloudscraper alone.
+Cloudflare on animepahe uses IUAM/Turnstile (real browser fingerprint check),
+which plain HTTP clients cannot pass. Session setup tries, in order:
+  1. Cached session  - cookies + user-agent saved in .session_cache.json
+                       by a previous run (reused for up to 3 hours).
+  2. Manual cookie   - the ANIMEPAHE_CF_CLEARANCE env var, copied from your
+                       own browser.
+  3. nodriver        - launches undetected Chrome, waits for the challenge to
+                       clear and captures the clearance cookies.
 
-Two modes are supported:
-  1. nodriver mode (recommended) - uses undetected Chrome to solve the
-     Cloudflare challenge automatically and grab clearance cookies.
+All later requests go through curl_cffi with a Chrome TLS fingerprint and the
+same user-agent, so Cloudflare accepts the captured cookies.
 
-  2. Manual cookie mode - you visit animepahe in your browser, copy the
-     cf_clearance cookie and set the ANIMEPAHE_CF_CLEARANCE env var.
-     This is the quick-start option that requires no extra setup.
+Download pipeline (see download_vid):
+  m3u8 playlist -> parallel segment download (resumable) -> AES key ->
+  local m3u8 -> ffmpeg decrypt + mux -> MP4 with cover art and chapters.
 
 See README.md for setup instructions.
 """
@@ -27,10 +32,9 @@ import shutil
 import warnings
 import concurrent.futures
 import threading
-import hashlib
 import random
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 
 from curl_cffi import requests as cffi_requests
 from urllib.parse import urlparse, quote
@@ -83,9 +87,8 @@ REQUEST_DELAY = 1.5
 _CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".session_cache.json")
 
 # ── Download configuration ───────────────────────────────────────────────────
-# Token bucket rate limiter for CDN connections (max concurrent segment downloads)
-_DL_WORKERS = 8
-_DL_RATE_LIMIT = 6          # max concurrent connections to CDN (token bucket)
+_DL_WORKERS = 8             # segment-download threads per episode
+_DL_RATE_LIMIT = 12         # max concurrent CDN connections across ALL episodes
 _DL_MAX_RETRIES = 5         # per-segment max retries
 _DL_BASE_BACKOFF = 1.0      # initial backoff seconds
 _DL_MAX_BACKOFF = 30.0      # max backoff seconds
@@ -101,176 +104,141 @@ _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads.
 
 @dataclass
 class EpisodeMeta:
-    """Episode metadata for embedding in MP4."""
-    episode: int
+    """Episode metadata embedded into the final MP4."""
+    episode: int | float
     title: str = ""
-    duration: str = ""  # HH:MM:SS format
+    duration: str = ""  # HH:MM:SS (filled from the m3u8 playlist at download time)
     snapshot_url: str = ""
     audio: str = ""
-    
+
     def duration_seconds(self) -> int:
-        """Parse duration string (HH:MM:SS) to seconds."""
+        """Parse duration string (HH:MM:SS or MM:SS) to seconds."""
         try:
-            parts = self.duration.split(':')
+            parts = [int(p) for p in self.duration.split(':')]
             if len(parts) == 3:
-                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-            elif len(parts) == 2:
-                return int(parts[0]) * 60 + int(parts[1])
-        except Exception:
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+            if len(parts) == 2:
+                return parts[0] * 60 + parts[1]
+        except ValueError:
             pass
         return 0
-    
+
     def chapter_times(self) -> list[int]:
-        """Generate chapter timestamps in seconds."""
+        """
+        Approximate chapter boundaries in seconds, giving three chapters:
+        Opening, Episode, Ending.
+
+        animepahe doesn't expose real OP/ED timings, so these are estimates
+        based on the typical TV-anime layout (OP ends ~1:30 in, ED starts
+        ~1:30 before the end). They make seeking easier, nothing more.
+        """
         total = self.duration_seconds()
         if total <= 0:
             return []
-        
-        # Typical anime structure: OP at ~1:30, content, ED at ~-1:30
-        # We'll create chapters at: start, after OP (~90s), before ED (~-90s), end
+
         chapters = [0]
-        
-        if total > 300:  # 5+ minutes
-            # Add chapter after typical OP (1:30 = 90s)
+        if total > 300:  # only episodes of 5+ minutes have a recognisable OP/ED
             chapters.append(min(90, total // 4))
-            # Add chapter before typical ED (1:30 before end)
-            if total > 180:
-                chapters.append(max(total - 90, chapters[-1] + 60))
-        
+            chapters.append(max(total - 90, chapters[-1] + 60))
         chapters.append(total)
         return sorted(set(chapters))
 
 
-def fetch_episode_meta(anime_id: str, ep_session: str) -> EpisodeMeta | None:
-    """Fetch episode metadata from the episode page."""
-    try:
-        url = f"{BASE_URL}/play/{anime_id}/{ep_session}"
+# Play pages are needed twice per episode (download links, then metadata).
+# Caching the HTML halves the requests to animepahe, which rate-limits hard.
+_play_page_cache: dict[str, str] = {}
+
+
+def _get_play_page(anime_id: str, ep_session: str) -> str:
+    """Return the HTML of an episode's play page (cached per run)."""
+    url = f"{BASE_URL}/play/{anime_id}/{ep_session}"
+    if url not in _play_page_cache:
         resp = _get(url, referer=f"{BASE_URL}/")
         resp.raise_for_status()
-        html = resp.text
-        
-        # Extract snapshot/thumbnails from the page - prefer i.animepahe.pw uploads URLs
+        _play_page_cache[url] = resp.text
+    return _play_page_cache[url]
+
+
+def fetch_episode_meta(anime_id: str, ep_session: str) -> EpisodeMeta | None:
+    """Extract title, thumbnail and audio type from the episode's play page."""
+    try:
+        html = _get_play_page(anime_id, ep_session)
+
+        # Episode thumbnail, used as cover art
         snapshot_match = re.search(
-            r'(https?://i\.animepahe\.pw/uploads/snapshots/[^\s"\'`]+)', html, re.IGNORECASE
+            r'(https?://i\.animepahe\.[a-z]+/uploads/snapshots/[^\s"\'`]+)', html, re.IGNORECASE
         )
         snapshot_url = snapshot_match.group(1) if snapshot_match else ""
-        
-        # Also check for episode title in the page
+
+        # Page <title>, e.g. "Death Note Ep. 1 :: animepahe"
         title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
         title = title_match.group(1).strip() if title_match else ""
-        
-        # Extract duration from the page
-        duration = ""
-        audio = ""
-        
-        # Try to find duration in the HTML (multiple patterns)
-        dur_patterns = [
-            r'duration[\s:="\'`]*([0-9:]{5,8})',
-            r'(\d{2}:\d{2}:\d{2})',
-            r'"duration"\s*:\s*"([^"]+)"',
-        ]
-        for pattern in dur_patterns:
-            dur_match = re.search(pattern, html, re.IGNORECASE)
-            if dur_match:
-                duration = dur_match.group(1)
-                break
-        
-        # Try audio
+        title = re.sub(r'\s*::\s*animepahe.*$', '', title, flags=re.IGNORECASE)
+
         aud_match = re.search(r'audio[\s:="\'`]*(eng|jpn|sub|dub)', html, re.IGNORECASE)
-        if aud_match:
-            audio = aud_match.group(1).upper()
-        
-        return EpisodeMeta(
-            episode=0,  # Will be set by caller
-            title=title,
-            duration=duration,
-            snapshot_url=snapshot_url,
-            audio=audio,
-        )
+        audio = aud_match.group(1).upper() if aud_match else ""
+
+        return EpisodeMeta(episode=0, title=title, snapshot_url=snapshot_url, audio=audio)
     except Exception as e:
         _log_event("meta_fetch_failed", error=str(e), anime_id=anime_id, ep_session=ep_session)
         return None
 
 
-def fetch_all_episode_meta(anime_id: str, eps: dict, requested_eps: list[int] | None = None) -> dict[int, EpisodeMeta]:
-    """Fetch metadata for all episodes from play pages.
-    
-    Fetches play page data for requested episodes to get:
-    - duration (if available in HTML)
-    - snapshot/thumbnail URL
-    - audio type
-    - title
-    
-    Note: Duration is extracted from play page HTML if available.
-    For One Piece (1166 eps), this avoids 39 API calls to release API.
+def fetch_all_episode_meta(anime_id: str, eps: dict, requested_eps: list) -> dict:
+    """Return {episode: EpisodeMeta} for the requested episodes.
+
+    Normally costs no extra requests: the play pages were already fetched
+    (and cached) while collecting download links.
     """
     meta = {}
-    
-    # Determine which episodes we actually need metadata for
-    if requested_eps is None:
-        requested_eps = list(eps.keys())
-    
-    ep_set = set(requested_eps)
-    
-    # Fetch play page data for each requested episode
-    for ep_num, ep_session in eps.items():
-        if requested_eps is not None and ep_num not in ep_set:
-            continue
-        ep_meta = fetch_episode_meta(anime_id, ep_session)
+    for ep_num in requested_eps:
+        ep_meta = fetch_episode_meta(anime_id, eps[ep_num])
         if ep_meta:
-            ep_meta.episode = int(ep_num)
-            meta[ep_meta.episode] = ep_meta
-    
+            ep_meta.episode = ep_num
+            meta[ep_num] = ep_meta
     return meta
 
 
 def download_thumbnail(url: str, tmp_dir: str) -> str | None:
-    """Download thumbnail image to temp dir."""
+    """Download the episode thumbnail and return a JPEG path usable as MP4 cover art.
+
+    MP4 can't hold WebP as an attached picture, so other formats are
+    converted to JPEG (Pillow first, ffmpeg as fallback). Returns None if
+    anything fails — the episode is then simply saved without a cover.
+    """
     if not url:
         return None
     try:
-        headers = {
-            "User-Agent": _user_agent,
-            "Referer": BASE_URL + "/",
-        }
-        resp = _session.get(url, headers=headers, timeout=30)
+        resp = _session.get(url, headers={"User-Agent": _user_agent, "Referer": BASE_URL + "/"},
+                            timeout=30)
         resp.raise_for_status()
-        
-        # Determine extension from URL or content-type
-        ext = ".webp"
-        if url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-            ext = os.path.splitext(url)[1]
-        elif 'image/jpeg' in resp.headers.get('Content-Type', ''):
-            ext = '.jpg'
-        elif 'image/png' in resp.headers.get('Content-Type', ''):
-            ext = '.png'
-        
-        thumb_path = os.path.join(tmp_dir, f"cover{ext}")
-        with open(thumb_path, "wb") as f:
+
+        ext = os.path.splitext(urlparse(url).path)[1].lower() or ".img"
+        raw_path = os.path.join(tmp_dir, f"cover_src{ext}")
+        with open(raw_path, "wb") as f:
             f.write(resp.content)
-        
-        return thumb_path
+
+        if ext in (".jpg", ".jpeg"):
+            return raw_path
+
+        jpg_path = os.path.join(tmp_dir, "cover.jpg")
+        try:
+            from PIL import Image
+            with Image.open(raw_path) as img:
+                img.convert("RGB").save(jpg_path, "JPEG", quality=90)
+        except Exception:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw_path, jpg_path],
+                           capture_output=True, check=False)
+        return jpg_path if os.path.exists(jpg_path) else None
     except Exception as e:
         _log_event("thumb_download_failed", error=str(e), url=url)
         return None
 
 
-# Semaphore-based rate limiter for controlling CDN connection concurrency
-class RateLimiter:
-    """Semaphore-based rate limiter for controlling CDN connection concurrency."""
-    def __init__(self, rate: int):
-        self._semaphore = threading.Semaphore(rate)
-    
-    def take(self, tokens: int = 1) -> float:
-        """Acquire semaphore tokens. Returns 0 on success, blocks otherwise."""
-        # Acquire one token (ignoring the tokens parameter for simplicity)
-        self._semaphore.acquire()
-        return 0.0
-    
-    def release(self, tokens: int = 1):
-        """Release semaphore tokens."""
-        for _ in range(tokens):
-            self._semaphore.release()
+# Caps simultaneous connections to the video CDN. Shared by every episode
+# downloading in parallel, so the total load stays polite (the CDN answers
+# with 429s when hammered).
+_cdn_slots = threading.Semaphore(_DL_RATE_LIMIT)
 
 
 @dataclass
@@ -283,12 +251,13 @@ class SegmentState:
     size: int = 0
     retries: int = 0
     last_error: str = ""
-    checksum: str = ""
+    checksum: str = ""  # unused; kept so state files from older versions still load
 
 
 @dataclass
 class DownloadState:
-    """Complete download state for resume capability."""
+    """Download progress saved next to the temp dir, so an interrupted
+    episode can resume instead of starting over."""
     m3u8_url: str
     title: str
     ep: str
@@ -301,10 +270,10 @@ class DownloadState:
     temp_dir: str
     local_m3u8_path: str
     output_file: str
-    
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
-    
+
     @classmethod
     def from_json(cls, data: str) -> "DownloadState":
         d = json.loads(data)
@@ -313,12 +282,8 @@ class DownloadState:
 
 
 def _log_event(event_type: str, **kwargs):
-    """Write structured JSONL log entry."""
-    entry = {
-        "timestamp": time.time(),
-        "event": event_type,
-        **kwargs
-    }
+    """Append a structured entry to downloads.log.jsonl (for debugging failures)."""
+    entry = {"timestamp": time.time(), "event": event_type, **kwargs}
     try:
         with open(_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
@@ -326,48 +291,37 @@ def _log_event(event_type: str, **kwargs):
         pass  # Logging failures should never break the download
 
 
-def _checksum_file(path: str) -> str:
-    """Compute SHA256 checksum of a file."""
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return ""
-
-
 def _load_download_state(state_path: str) -> Optional[DownloadState]:
     """Load download state from sidecar file."""
     try:
-        with open(state_path, "r") as f:
+        with open(state_path, "r", encoding="utf-8") as f:
             return DownloadState.from_json(f.read())
     except Exception:
         return None
 
 
 def _save_download_state(state: DownloadState):
-    """Save download state to sidecar file."""
+    """Atomically write download state (write temp file, then replace)."""
     state.updated_at = time.time()
+    path = state.temp_dir + _STATE_FILE_SUFFIX
     try:
-        with open(state.temp_dir + _STATE_FILE_SUFFIX, "w") as f:
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
             f.write(state.to_json())
+        os.replace(path + ".tmp", path)
     except Exception as e:
-        _log_event("state_save_failed", error=str(e), state_path=state.temp_dir + _STATE_FILE_SUFFIX)
+        _log_event("state_save_failed", error=str(e), state_path=path)
 
 
 def _verify_segment(path: str, expected_size: int = 0) -> bool:
-    """Verify segment file exists and has expected size."""
+    """Verify segment file exists, is non-empty and (if known) has the expected size."""
     try:
-        if not os.path.exists(path):
-            return False
         actual_size = os.path.getsize(path)
-        if expected_size and actual_size != expected_size:
-            return False
-        return actual_size > 0
-    except Exception:
+    except OSError:
         return False
+    if expected_size and actual_size != expected_size:
+        return False
+    return actual_size > 0
+
 
 # ── Session state ─────────────────────────────────────────────────────────────
 _session = cffi_requests.Session(impersonate="chrome")
@@ -401,7 +355,7 @@ def _save_session_cache():
     try:
         with open(_CACHE_FILE, "w") as f:
             json.dump(cache, f, indent=2)
-        print(Fore.GREEN + f"[cache] session saved -> reuse on next run" + Fore.RESET)
+        print(Fore.GREEN + "[cache] session saved -> reuse on next run" + Fore.RESET)
     except OSError as e:
         print(Fore.YELLOW + f"[cache] could not save: {e}" + Fore.RESET)
 
@@ -450,7 +404,7 @@ def _try_cached_session() -> bool:
             print(Fore.GREEN + f"[cache] loaded saved session ({age_min:.0f}m old) [OK]" + Fore.RESET)
             return True
         elif resp.status_code == 403:
-            print(Fore.YELLOW + f"[cache] cookies expired (403), re-solving..." + Fore.RESET)
+            print(Fore.YELLOW + "[cache] cookies expired (403), re-solving..." + Fore.RESET)
             _session.cookies.clear()
             return False
         else:
@@ -496,8 +450,6 @@ def _try_nodriver() -> bool:
     Opens a real Chrome window, waits for the challenge to clear, grabs cookies.
     Returns True on success.
     """
-    global _cf_cookies, _user_agent, BASE_URL
-
     try:
         import nodriver as uc
     except ImportError:
@@ -522,26 +474,26 @@ def _try_nodriver() -> bool:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
 
-            # Check page content - in nodriver v0.50+, page.title and page.url are often empty
-            # So we rely on page content to detect challenge clearance
+            # The challenge page is titled "Just a moment..."; once it clears,
+            # Cloudflare redirects to the real site (title "animepahe :: ...").
+            # page.title is often stale in nodriver, so ask the DOM directly.
             try:
-                page_content = await page.get_content()
+                doc_title = str(await page.evaluate("document.title") or "")
             except Exception:
-                page_content = ""
+                doc_title = ""
 
-            # Cloudflare challenge pages have "Just a moment" in content
-            if "Just a moment" in page_content or "Checking" in page_content:
-                if elapsed % 15 == 0:
-                    print(Fore.YELLOW + f"[nodriver] still solving challenge... ({elapsed}s)" + Fore.RESET)
-                continue
-
-            # If page has meaningful content (not just CF block), we're through
-            if page_content and len(page_content) > 5000:
-                print(Fore.GREEN + f"[nodriver] challenge cleared in {elapsed}s [OK]" + Fore.RESET)
-                break
+            if doc_title and "just a moment" not in doc_title.lower():
+                # cf_clearance can show up a few seconds after the redirect
+                try:
+                    names = {c.name for c in await browser.cookies.get_all()}
+                except Exception:
+                    names = set()
+                if "cf_clearance" in names:
+                    print(Fore.GREEN + f"[nodriver] challenge cleared in {elapsed}s [OK]" + Fore.RESET)
+                    break
 
             if elapsed % 15 == 0:
-                print(Fore.YELLOW + f"[nodriver] waiting for page load... ({elapsed}s, content len: {len(page_content)})" + Fore.RESET)
+                print(Fore.YELLOW + f"[nodriver] still solving challenge... ({elapsed}s)" + Fore.RESET)
         else:
             print(Fore.RED + f"[nodriver] timed out after {max_wait}s" + Fore.RESET)
             try:
@@ -550,10 +502,10 @@ def _try_nodriver() -> bool:
                 pass
             return False
 
-        # Update BASE_URL if we got redirected
+        # Update BASE_URL if we got redirected to a new domain
         try:
-            final_url = page.url
-            if final_url:
+            final_url = str(await page.evaluate("location.href") or "")
+            if final_url.startswith("http"):
                 parsed = urlparse(final_url)
                 new_base = f"{parsed.scheme}://{parsed.netloc}"
                 if new_base != BASE_URL:
@@ -696,7 +648,8 @@ def _get(url: str, **kwargs):
                 time.sleep(_RETRY_BACKOFF * (2 ** attempt))
                 continue
             raise
-    raise last_err
+    # Unreachable: the final attempt always returns or raises above
+    raise last_err or RuntimeError(f"request failed: {url}")
 
 
 # ── Search ────────────────────────────────────────────────────────────────────
@@ -755,74 +708,75 @@ def show_results_get_id(results: dict) -> list:
 
 # ── Episode list ──────────────────────────────────────────────────────────────
 
-async def _fetch_page_async(url: str, cookies: dict, ua: str) -> str | None:
-    headers = {
-        "User-Agent": ua,
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{BASE_URL}/",
-    }
-    try:
-        async with cffi_requests.AsyncSession(impersonate="chrome") as session:
-            resp = await session.get(url, headers=headers, cookies=cookies, timeout=20)
-            resp.raise_for_status()
-            return resp.text
-    except Exception as exc:
-        print(Fore.RED + f"[warn] async fetch failed for {url}: {exc}" + Fore.RESET)
-        return None
+_EP_PAGE_CONCURRENCY = 4   # parallel release-page requests (more triggers 429s)
 
 
-async def _fetch_all_pages_async(urls: list, cookies: dict, ua: str) -> list:
-    tasks = [_fetch_page_async(u, cookies, ua) for u in urls]
-    return await asyncio.gather(*tasks)
+async def _fetch_page_async(session, sem: asyncio.Semaphore, url: str) -> str | None:
+    """Fetch one release-API page, retrying rate-limit/server errors with backoff."""
+    headers = _build_headers()
+    async with sem:
+        for attempt in range(_RETRY_TOTAL + 1):
+            try:
+                resp = await session.get(url, headers=headers, timeout=20)
+                if resp.status_code in _RETRY_STATUS_CODES and attempt < _RETRY_TOTAL:
+                    base = _RETRY_429_BASE_BACKOFF if resp.status_code == 429 else _RETRY_BACKOFF
+                    await asyncio.sleep(base * (2 ** attempt) + random.uniform(0, 1))
+                    continue
+                resp.raise_for_status()
+                return resp.text
+            except Exception as exc:
+                if attempt < _RETRY_TOTAL:
+                    await asyncio.sleep(_RETRY_BACKOFF * (2 ** attempt))
+                    continue
+                print(Fore.RED + f"[warn] episode page fetch failed for {url}: {exc}" + Fore.RESET)
+    return None
 
 
 async def get_episode_list(anime_id: str, last_page: int) -> dict:
     """
-    Fetches all release pages concurrently.
-    Returns { episode_number(int|float): session_id(str) }
+    Fetch every page of the release API (30 episodes per page) concurrently.
+    Returns { episode_number(int|float): session_id(str) }.
     """
     init_session()
-    cookies = dict(_session.cookies)
     urls = [
         f"{BASE_URL}/api?m=release&id={anime_id}&sort=episode_asc&page={p}"
         for p in range(1, last_page + 1)
     ]
 
-    responses = await _fetch_all_pages_async(urls, cookies, _user_agent)
+    sem = asyncio.Semaphore(_EP_PAGE_CONCURRENCY)
+    async with cffi_requests.AsyncSession(impersonate="chrome",
+                                          cookies=dict(_session.cookies)) as session:
+        responses = await asyncio.gather(*(_fetch_page_async(session, sem, u) for u in urls))
+
+    missing = sum(1 for r in responses if not r)
+    if missing:
+        print(Fore.YELLOW + f"[warn] {missing}/{len(urls)} episode page(s) could not be "
+              f"fetched - some episodes may be missing from the list" + Fore.RESET)
 
     eps: dict = {}
     for text in responses:
         if not text:
             continue
         try:
-            data = json.loads(text)
-            for item in data.get("data", []):
-                eps[float(item["episode"])] = item["session"]
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            for item in json.loads(text).get("data", []):
+                num = float(item["episode"])
+                # Whole numbers as int (5, not 5.0); specials keep their fraction (12.5)
+                eps[int(num) if num == int(num) else num] = item["session"]
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             print(Fore.YELLOW + f"[warn] failed to parse episode page: {e}" + Fore.RESET)
 
-    eps_clean = {}
-    for k, v in eps.items():
-        key = int(k) if k == int(k) else k
-        eps_clean[key] = v
-
-    ep_keys = sorted(eps_clean.keys())
-    # NOTE: Episode range display is handled by caller (_select_episodes in main.py)
-    # to avoid duplicate prints
-    return eps_clean
+    return eps
 
 
 # ── Episode page -> kwik links ─────────────────────────────────────────────────
 
 def get_ep_links(anime_id: str, ep_session: str) -> list:
     """
-    Returns list of (kwik_url, quality_label, audio_type) tuples.
+    Scrape the episode's play page for its kwik embed links.
+    Returns a list of (kwik_url, quality_label, audio_type) tuples,
+    e.g. ("https://kwik.cx/e/abc", "1080p", "jpn").
     """
-    url = f"{BASE_URL}/play/{anime_id}/{ep_session}"
-    resp = _get(url, referer=f"{BASE_URL}/")
-    resp.raise_for_status()
-    html = resp.text
+    html = _get_play_page(anime_id, ep_session)
 
     # 2026 format: <button data-src="https://kwik.cx/e/xxx" data-resolution="1080" data-audio="jpn">
     matches = re.findall(
@@ -861,7 +815,9 @@ def get_ep_links(anime_id: str, ep_session: str) -> list:
         raw = re.findall(r'(?:data-src|href|src)="(https://kwik\.[a-z]+/[^"]+)"', html)
         matches = [(m, "unknown", "") for m in raw]
 
-    return matches
+    # Normalise quality labels ("1080" -> "1080p") so every format displays alike
+    return [(url, q.strip() + "p" if q.strip().isdigit() else q.strip(), aud.strip())
+            for url, q, aud in matches]
 
 
 def show_dl_opts(links: list) -> list:
@@ -892,61 +848,120 @@ def _sanitize(name: str) -> str:
 
 # ── Parallel HLS downloader with resume & rate limiting ───────────────────────
 
-def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/",
-                  meta: EpisodeMeta | None = None, no_resume: bool = False):
+_STATE_SAVE_INTERVAL = 2.0   # seconds between progress-state writes during a download
+
+
+def _format_hms(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def _build_ffmpeg_cmd(local_m3u8: str, out_path: str, tmp_dir: str, show_title: str,
+                      meta: EpisodeMeta | None) -> list:
+    """Build the ffmpeg command that decrypts + muxes the local playlist into MP4.
+
+    Inputs: 0 = local m3u8, then optionally cover art and a chapters file.
+    Streams are copied (no re-encode), so this takes seconds.
     """
-    Download HLS stream to  <title>/<title> ep_XX.mp4.
+    inputs = ["-allowed_extensions", "ALL", "-i", local_m3u8]
+    maps = ["-map", "0:v:0", "-map", "0:a?"]
+    codecs = ["-c", "copy"]
+    extra = []
+    next_input = 1
+
+    if meta:
+        # Cover art -> attached picture stream
+        cover = download_thumbnail(meta.snapshot_url, tmp_dir)
+        if cover:
+            inputs += ["-i", cover]
+            maps += ["-map", f"{next_input}:v"]
+            codecs += ["-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic"]
+            next_input += 1
+
+        # Chapters, written in ffmpeg's FFMETADATA format
+        chapters = meta.chapter_times()
+        if len(chapters) > 1:
+            names = ["Opening", "Episode", "Ending"] if len(chapters) == 4 else ["Episode"]
+            chapter_file = os.path.join(tmp_dir, "chapters.txt")
+            with open(chapter_file, "w", encoding="utf-8") as f:
+                f.write(";FFMETADATA1\n")
+                for i, (start, end) in enumerate(zip(chapters, chapters[1:])):
+                    name = names[i] if i < len(names) else f"Part {i + 1}"
+                    f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start * 1000}\n"
+                            f"END={end * 1000}\ntitle={name}\n")
+            inputs += ["-i", chapter_file]
+            extra += ["-map_chapters", str(next_input)]
+            next_input += 1
+
+        if meta.title:
+            extra += ["-metadata", f"title={meta.title}"]
+        extra += ["-metadata", f"episode_id={meta.episode}", "-metadata", f"show={show_title}"]
+
+    return (["ffmpeg"] + inputs + maps + codecs + extra + [
+        "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart",
+        "-f", "mp4",                 # explicit: the .part extension says nothing
+        "-loglevel", "error",
+        "-y", out_path,
+    ])
+
+
+def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/",
+                 meta: EpisodeMeta | None = None, no_resume: bool = False,
+                 output_dir: str | None = None) -> bool:
+    """
+    Download an HLS stream to  <output_dir>/<title>/<title> ep_XX.mp4.
+    Returns True on success (or if the file already exists), False on failure.
 
     Segments are AES-128 encrypted, so the flow is:
       1. Fetch + parse the remote m3u8 playlist
-      2. Download all segments in parallel (rate-limited, with resume)
-      3. Download the encryption key
-      4. Build a LOCAL m3u8 referencing local files + key
-      5. Feed the local m3u8 to ffmpeg (decrypts + muxes to mp4)
-      6. Embed cover art and chapters from metadata
+      2. Download the encryption key(s)
+      3. Download all segments in parallel (rate-limited, resumable)
+      4. Build a LOCAL m3u8 referencing the local segments + key
+      5. ffmpeg decrypts + muxes it to MP4, adding cover art and chapters
+
+    The MP4 is written as "<name>.mp4.part" and renamed when complete, so an
+    interrupted run never leaves a broken file that looks finished. On
+    failure the temp segments are kept, so the next run resumes.
     """
     safe_title = _sanitize(title)
     ep_str = f"{int(ep):02d}" if isinstance(ep, (int, float)) and ep == int(ep) else str(ep)
-    os.makedirs(safe_title, exist_ok=True)
-    out_file = os.path.join(safe_title, f"{safe_title} ep_{ep_str}.mp4")
+    show_dir = os.path.join(output_dir or ".", safe_title)
+    os.makedirs(show_dir, exist_ok=True)
+    out_file = os.path.join(show_dir, f"{safe_title} ep_{ep_str}.mp4")
     out_file_abs = os.path.abspath(out_file)
+    part_file_abs = out_file_abs + ".part"
 
-    # Skip if already downloaded
+    # ── Skip if already downloaded ────────────────────────────────────────────
     if os.path.exists(out_file_abs) and os.path.getsize(out_file_abs) > 0:
-        print(Fore.GREEN + f"\n[skip] Ep {ep_str} already downloaded -> .{os.sep}{out_file}" + Fore.RESET)
-        _log_event("skip_existing", episode=ep_str, output=out_file, size=os.path.getsize(out_file_abs))
-        return
+        print(Fore.GREEN + f"\n[skip] Ep {ep_str} already downloaded -> {out_file}" + Fore.RESET)
+        _log_event("skip_existing", episode=ep_str, output=out_file)
+        return True
 
-    print(Fore.LIGHTYELLOW_EX + f"\nDownloading Ep {ep_str} -> .{os.sep}{out_file}" + Fore.RESET)
+    print(Fore.LIGHTYELLOW_EX + f"\nDownloading Ep {ep_str} -> {out_file}" + Fore.RESET)
     _log_event("download_start", episode=ep_str, m3u8_url=m3u8_url, output=out_file)
 
     # ── Step 1: Fetch and parse m3u8 playlist ─────────────────────────────────
-    dl_headers = {
-        "User-Agent": _user_agent,
-        "Referer": referer,
-    }
-
+    dl_headers = {"User-Agent": _user_agent, "Referer": referer}
     try:
         m3u8_resp = cffi_requests.get(m3u8_url, headers=dl_headers, timeout=30, impersonate="chrome")
         m3u8_resp.raise_for_status()
     except Exception as e:
         print(Fore.RED + f"[error] failed to fetch m3u8 playlist: {e}" + Fore.RESET)
         _log_event("m3u8_fetch_failed", episode=ep_str, error=str(e))
-        return
+        return False
 
     m3u8_text = m3u8_resp.text
     m3u8_lines = m3u8_text.strip().split('\n')
 
-    # Extract segment URLs and calculate total duration from #EXTINF tags
+    # Segment URLs are the non-comment lines; #EXTINF:<seconds>, gives each one's length
     segments = []
     total_duration = 0.0
-    for i, line in enumerate(m3u8_lines):
+    for line in m3u8_lines:
         line = line.strip()
         if line.startswith('#EXTINF:'):
-            # Format: #EXTINF:<duration>,<title>
             try:
-                duration_str = line.split(':', 1)[1].split(',')[0]
-                total_duration += float(duration_str)
+                total_duration += float(line.split(':', 1)[1].split(',')[0])
             except (ValueError, IndexError):
                 pass
         elif line and not line.startswith('#'):
@@ -955,77 +970,65 @@ def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/
     if not segments:
         print(Fore.RED + "[error] no segments found in m3u8 playlist" + Fore.RESET)
         _log_event("no_segments", episode=ep_str)
-        return
+        return False
 
-    # Extract encryption key URL(s)
+    # The playlist knows the exact runtime - more reliable than scraping the page
+    if meta and total_duration > 0:
+        meta.duration = _format_hms(total_duration)
+
     key_urls = re.findall(r'#EXT-X-KEY:.*?URI="([^"]+)"', m3u8_text)
-
     total_segments = len(segments)
     encrypted = "encrypted, " if key_urls else ""
-    print(Fore.WHITE + f"  {total_segments} segments ({encrypted}{_DL_WORKERS} workers, {_DL_RATE_LIMIT} rate limit)..." + Fore.RESET)
+    print(Fore.WHITE + f"  {total_segments} segments ({encrypted}{_format_hms(total_duration)} long)"
+          + Fore.RESET)
 
-    # ── Step 2: Check for resume state ────────────────────────────────────────
-    # We'll use a temp dir named after the episode for easier resumption
+    # ── Step 2: Temp dir + resume state ───────────────────────────────────────
+    # Named after the episode, so a re-run finds the same dir and resumes
     tmp_dir = os.path.join(tempfile.gettempdir(), f"animepahe_{safe_title}_ep{ep_str}")
-    os.makedirs(tmp_dir, exist_ok=True)
     state_path = tmp_dir + _STATE_FILE_SUFFIX
-
-    # Try to load existing state
     existing_state = _load_download_state(state_path)
-    resume = False
-    if not no_resume and existing_state and existing_state.m3u8_url == m3u8_url:
-        # Verify the existing temp dir and segments
-        resume = True
-        print(Fore.CYAN + f"  [resume] Found existing download state, verifying..." + Fore.RESET)
-        _log_event("resume_attempt", episode=ep_str, temp_dir=tmp_dir)
+    resume = (not no_resume and existing_state is not None
+              and existing_state.m3u8_url == m3u8_url
+              and existing_state.total_segments == total_segments)
 
-    # ── Step 3: Create temp dir, download key + segments in parallel ──────────
     if not resume:
-        # Fresh download - clean temp dir
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(tmp_dir, exist_ok=True)
 
-    # Download encryption key(s) to temp dir
+    # Download encryption key(s) into the temp dir
     key_map = {}  # remote_url -> local_filename
     for i, key_url in enumerate(key_urls):
         key_filename = f"key_{i}.key"
         key_path = os.path.join(tmp_dir, key_filename)
-        if not os.path.exists(key_path):
+        if not _verify_segment(key_path):
             try:
                 key_resp = cffi_requests.get(key_url, headers=dl_headers, timeout=30, impersonate="chrome")
                 key_resp.raise_for_status()
                 with open(key_path, "wb") as f:
                     f.write(key_resp.content)
-                _log_event("key_downloaded", episode=ep_str, key_index=i, key_url=key_url, size=len(key_resp.content))
             except Exception as e:
                 print(Fore.RED + f"[error] failed to download encryption key: {e}" + Fore.RESET)
-                _log_event("key_download_failed", episode=ep_str, key_index=i, key_url=key_url, error=str(e))
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                return
+                _log_event("key_download_failed", episode=ep_str, key_url=key_url, error=str(e))
+                return False
         key_map[key_url] = key_filename
 
-    # Map remote segment URLs to local filenames
-    seg_filenames = {}  # remote_url -> local_filename
-    for idx, url in enumerate(segments):
-        seg_filenames[url] = f"seg_{idx:05d}.ts"
+    seg_filenames = {url: f"seg_{idx:05d}.ts" for idx, url in enumerate(segments)}
 
-    # Build segment state list (for resume tracking)
-    segment_states = []
-    if resume and existing_state:
-        # Use existing segment states
+    if resume:
         segment_states = existing_state.segments
-        # Ensure we have all segments
-        if len(segment_states) != total_segments:
-            print(Fore.YELLOW + f"  [resume] Segment count mismatch ({len(segment_states)} vs {total_segments}), starting fresh" + Fore.RESET)
-            resume = False
-            segment_states = []
-    if not resume:
-        segment_states = [
-            SegmentState(index=idx, url=url, filename=seg_filenames[url])
-            for idx, url in enumerate(segments)
-        ]
+        completed = 0
+        for seg_state in segment_states:
+            seg_state.downloaded = _verify_segment(os.path.join(tmp_dir, seg_state.filename),
+                                                   seg_state.size)
+            completed += seg_state.downloaded
+        print(Fore.CYAN + f"  [resume] {completed}/{total_segments} segments already downloaded"
+              + Fore.RESET)
+        _log_event("resume", episode=ep_str, completed=completed, total=total_segments)
+    else:
+        segment_states = [SegmentState(index=idx, url=url, filename=seg_filenames[url])
+                          for idx, url in enumerate(segments)]
+        completed = 0
 
-    # Create download state object
     local_m3u8_path = os.path.join(tmp_dir, "local.m3u8")
     download_state = DownloadState(
         m3u8_url=m3u8_url,
@@ -1035,304 +1038,147 @@ def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/
         segments=segment_states,
         key_urls=key_urls,
         key_map=key_map,
-        started_at=time.time() if not resume else existing_state.started_at,
+        started_at=existing_state.started_at if resume else time.time(),
         updated_at=time.time(),
         temp_dir=tmp_dir,
         local_m3u8_path=local_m3u8_path,
         output_file=out_file_abs,
     )
+    _save_download_state(download_state)
 
-    # Verify already-downloaded segments (on resume)
-    completed = 0
-    if resume:
-        for seg_state in segment_states:
-            seg_path = os.path.join(tmp_dir, seg_state.filename)
-            if _verify_segment(seg_path):
-                seg_state.downloaded = True
-                seg_state.size = os.path.getsize(seg_path)
-                seg_state.checksum = _checksum_file(seg_path)
-                completed += 1
-            else:
-                seg_state.downloaded = False
-        print(Fore.CYAN + f"  [resume] Verified {completed}/{total_segments} segments" + Fore.RESET)
-        _log_event("resume_verified", episode=ep_str, completed=completed, total=total_segments)
-
-    # Shared progress state
+    # ── Step 3: Download segments in parallel ─────────────────────────────────
     lock = threading.Lock()
-    progress = {"done": completed, "bytes": sum(s.size for s in segment_states if s.downloaded), "failed": 0}
+    progress = {"done": completed, "bytes": 0, "failed": 0, "last_save": time.time()}
     start_wall = time.time()
 
-    # Rate limiter (shared across workers)
-    rate_limiter = RateLimiter(_DL_RATE_LIMIT)
+    def _save_state_throttled(force: bool = False):
+        """Persist progress at most every few seconds (thousands of segments
+        would otherwise mean thousands of JSON rewrites)."""
+        with lock:
+            if not force and time.time() - progress["last_save"] < _STATE_SAVE_INTERVAL:
+                return
+            progress["last_save"] = time.time()
+            _save_download_state(download_state)
 
     def _download_segment(seg_state: SegmentState) -> bool:
-        """Download a single segment with retries, backoff, and rate limiting."""
-        idx = seg_state.index
-        url = seg_state.url
-        filename = seg_state.filename
-        seg_path = os.path.join(tmp_dir, filename)
-
-        # Skip if already downloaded and verified
-        if seg_state.downloaded and _verify_segment(seg_path, seg_state.size):
-            with lock:
-                progress["done"] += 1
-                progress["bytes"] += seg_state.size
-            return True
-
-        max_retries = _DL_MAX_RETRIES
+        """Download one segment with retries, exponential backoff and jitter."""
+        seg_path = os.path.join(tmp_dir, seg_state.filename)
         backoff = _DL_BASE_BACKOFF
 
-        for attempt in range(max_retries):
-            # Rate limit: wait for token
-            wait_time = rate_limiter.take(1)
-            if wait_time > 0:
-                time.sleep(wait_time)
-
+        for attempt in range(1, _DL_MAX_RETRIES + 1):
+            error = None
+            wait = backoff
             try:
-                resp = cffi_requests.get(url, headers=dl_headers, timeout=_DL_TIMEOUT, impersonate="chrome")
-
-                # Handle HTTP errors with retry logic
-                if resp.status_code in (429, 500, 502, 503, 504):
-                    # Check for Retry-After header
+                with _cdn_slots:  # hold a CDN slot only while the request is in flight
+                    resp = cffi_requests.get(seg_state.url, headers=dl_headers,
+                                             timeout=_DL_TIMEOUT, impersonate="chrome")
+                if resp.status_code in _RETRY_STATUS_CODES:
+                    error = f"HTTP {resp.status_code}"
                     retry_after = resp.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            wait = float(retry_after)
-                        except ValueError:
-                            wait = backoff
-                    else:
-                        wait = backoff
+                    if retry_after and retry_after.isdigit():
+                        wait = min(float(retry_after), _DL_MAX_BACKOFF)
+                else:
+                    resp.raise_for_status()
+                    if not resp.content:
+                        raise IOError("empty segment")
+                    with open(seg_path, "wb") as f:
+                        f.write(resp.content)
+            except Exception as e:
+                error = str(e)
 
-                    # Add jitter
-                    wait += random.uniform(0, wait * _DL_JITTER)
-                    _log_event("segment_retry", episode=ep_str, segment=idx, attempt=attempt+1,
-                              status=resp.status_code, wait=wait, url=url)
-                    resp.close()
-                    if attempt < max_retries - 1:
-                        time.sleep(wait)
-                        backoff = min(backoff * 2, _DL_MAX_BACKOFF)
-                        seg_state.retries = attempt + 1
-                        seg_state.last_error = f"HTTP {resp.status_code}"
-                        _save_download_state(download_state)
-                        continue
-                    else:
-                        raise Exception(f"HTTP {resp.status_code} after {max_retries} retries")
-
-                resp.raise_for_status()
-
-                # Write segment content
-                with open(seg_path, "wb") as f:
-                    f.write(resp.content)
-
-                # Verify download
-                size = os.path.getsize(seg_path)
-                if size == 0:
-                    raise IOError("Downloaded segment is empty")
-
+            seg_state.retries = attempt
+            if error is None:
                 seg_state.downloaded = True
-                seg_state.size = size
-                seg_state.checksum = _checksum_file(seg_path)
-                seg_state.retries = attempt + 1
+                seg_state.size = len(resp.content)
                 seg_state.last_error = ""
-
                 with lock:
                     progress["done"] += 1
-                    progress["bytes"] += size
-                    done = progress["done"]
-                    total_bytes = progress["bytes"]
-
-                pct = done / total_segments * 100
-                size_mb = total_bytes / (1024 * 1024)
+                    progress["bytes"] += seg_state.size
+                    done, total_bytes = progress["done"], progress["bytes"]
                 elapsed = time.time() - start_wall
+                size_mb = total_bytes / (1024 * 1024)
                 speed = size_mb / elapsed if elapsed > 0.5 else 0.0
-                status = (
-                    f"\r  {Fore.WHITE}"
-                    f"{done}/{total_segments} ({pct:4.1f}%)  "
-                    f"size= {size_mb:7.1f} MB  "
-                    f"speed= {speed:5.2f} MB/s"
-                    f"{Fore.RESET}"
+                sys.stdout.write(
+                    f"\r  {Fore.WHITE}{done}/{total_segments} ({done / total_segments * 100:4.1f}%)  "
+                    f"size= {size_mb:7.1f} MB  speed= {speed:5.2f} MB/s{Fore.RESET}"
                 )
-                sys.stdout.write(status)
                 sys.stdout.flush()
-
-                _log_event("segment_downloaded", episode=ep_str, segment=idx, size=size,
-                          attempt=attempt+1, speed_mbps=speed)
-                _save_download_state(download_state)
+                _save_state_throttled()
                 return True
 
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    seg_state.retries = max_retries
-                    seg_state.last_error = str(e)
-                    _log_event("segment_failed", episode=ep_str, segment=idx,
-                              error=str(e), retries=max_retries, url=url)
-                    _save_download_state(download_state)
-                    with lock:
-                        progress["failed"] += 1
-                        progress["done"] += 1
-                    return False
-                else:
-                    # Exponential backoff with jitter
-                    wait = backoff + random.uniform(0, backoff * _DL_JITTER)
-                    _log_event("segment_retry", episode=ep_str, segment=idx, attempt=attempt+1,
-                              wait=wait, error=str(e), url=url)
-                    time.sleep(wait)
-                    backoff = min(backoff * 2, _DL_MAX_BACKOFF)
-                    seg_state.retries = attempt + 1
-                    seg_state.last_error = str(e)
-                    _save_download_state(download_state)
-            finally:
-                rate_limiter.release()
+            seg_state.last_error = error
+            if attempt < _DL_MAX_RETRIES:
+                time.sleep(wait + random.uniform(0, wait * _DL_JITTER))
+                backoff = min(backoff * 2, _DL_MAX_BACKOFF)
 
+        _log_event("segment_failed", episode=ep_str, segment=seg_state.index,
+                   error=seg_state.last_error, url=seg_state.url)
+        with lock:
+            progress["failed"] += 1
         return False
 
-    # Download segments in parallel
     remaining_segments = [s for s in segment_states if not s.downloaded]
     if remaining_segments:
-        print(Fore.WHITE + f"  Downloading {len(remaining_segments)} remaining segments..." + Fore.RESET)
+        print(Fore.WHITE + f"  Downloading {len(remaining_segments)} segments "
+              f"({_DL_WORKERS} workers)..." + Fore.RESET)
         with concurrent.futures.ThreadPoolExecutor(max_workers=_DL_WORKERS) as executor:
-            executor.map(_download_segment, remaining_segments)
+            list(executor.map(_download_segment, remaining_segments))
+        print()  # newline after the \r progress line
+    _save_state_throttled(force=True)
 
-    print()  # newline after \r progress
-
+    # Every segment is needed - muxing with gaps would produce a broken video.
+    # Downloaded segments stay in the temp dir, so a re-run only fetches the rest.
     failed = progress["failed"]
-    if failed > 0:
-        print(Fore.YELLOW + f"  {failed} segment(s) failed to download" + Fore.RESET)
+    if failed:
+        print(Fore.RED + f"[error] {failed}/{total_segments} segment(s) failed to download. "
+              f"Run again to resume this episode." + Fore.RESET)
+        _log_event("download_aborted", episode=ep_str, failed=failed, total=total_segments)
+        return False
 
-    # Allow up to 10% failure but log it
-    if failed > total_segments * 0.1:
-        print(Fore.RED + f"[error] too many failed segments ({failed}/{total_segments}), aborting" + Fore.RESET)
-        _log_event("download_aborted", episode=ep_str, failed=failed, total=total_segments, reason="too_many_failures")
-        # Don't delete temp dir on failure - keep for potential resume
-        return
-
-    # ── Step 4: Build local m3u8 with relative paths ──────────────────────────
-    print(Fore.WHITE + "  Building local m3u8..." + Fore.RESET)
-    with open(local_m3u8_path, "w") as f:
+    # ── Step 4: Build local m3u8 pointing at the local files ──────────────────
+    with open(local_m3u8_path, "w", encoding="utf-8") as f:
         for line in m3u8_lines:
             stripped = line.strip()
             if stripped in seg_filenames:
-                f.write(seg_filenames[stripped] + "\n")
-            elif '#EXT-X-KEY:' in stripped:
-                new_line = stripped
+                stripped = seg_filenames[stripped]
+            elif stripped.startswith('#EXT-X-KEY:'):
                 for remote_url, local_name in key_map.items():
-                    new_line = new_line.replace(remote_url, local_name)
-                f.write(new_line + "\n")
-            else:
-                f.write(stripped + "\n")
+                    stripped = stripped.replace(remote_url, local_name)
+            f.write(stripped + "\n")
 
     # ── Step 5: ffmpeg decrypts + muxes to mp4 (local I/O, fast) ──────────────
-    # Also embed metadata (cover art, chapters) if available
     print(Fore.WHITE + "  Decrypting + muxing to mp4..." + Fore.RESET, end=" ", flush=True)
-    
-    # Prepare metadata args
-    meta_args = []
-    chapter_file = None
-    thumb_path = None
-    
-    if meta:
-        # Download thumbnail/cover art
-        if meta.snapshot_url:
-            thumb_path = download_thumbnail(meta.snapshot_url, tmp_dir)
-            if thumb_path:
-                # Convert WebP to JPEG if needed (MP4 doesn't support WebP as attached pic)
-                cover_path = thumb_path
-                if thumb_path.lower().endswith('.webp'):
-                    # Convert WebP to JPEG using PIL or ffmpeg
-                    converted_path = os.path.join(tmp_dir, "cover.jpg")
-                    try:
-                        # Try PIL first
-                        from PIL import Image
-                        img = Image.open(thumb_path)
-                        img.convert('RGB').save(converted_path, 'JPEG', quality=90)
-                        cover_path = converted_path
-                    except Exception:
-                        # Fallback to ffmpeg
-                        cmd_conv = ["ffmpeg", "-y", "-i", thumb_path, "-c:v", "mjpeg", "-q:v", "2", cover_path]
-                        subprocess.run(cmd_conv, capture_output=True, check=False, cwd=tmp_dir)
-                        cover_path = converted_path
-                
-                meta_args.extend(["-i", cover_path])
-                meta_args.extend([
-                    "-map", "0:v", "-map", "0:a",
-                    "-map", "1:v",
-                    "-disposition:v:1", "attached_pic",
-                    "-c:v:1", "mjpeg",
-                ])
-        
-        # Generate chapter metadata file
-        chapters = meta.chapter_times()
-        if len(chapters) > 1:
-            chapter_file = os.path.join(tmp_dir, "chapters.txt")
-            with open(chapter_file, "w", encoding="utf-8") as f:
-                f.write(";FFMETADATA1\n")
-                for i, start in enumerate(chapters):
-                    end = chapters[i + 1] if i + 1 < len(chapters) else meta.duration_seconds()
-                    f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start * 1000}\nEND={end * 1000}\n")
-                    if i == 0:
-                        f.write("title=Start\n")
-                    elif i == len(chapters) - 1:
-                        f.write("title=End\n")
-                    elif i == 1:
-                        f.write("title=Opening\n")
-                    elif i == len(chapters) - 2:
-                        f.write("title=Ending\n")
-                    else:
-                        f.write(f"title=Part {i}\n")
-            # Chapter input index depends on whether cover art was added
-            chapter_input_idx = 2 if thumb_path else 1
-            meta_args.extend(["-i", chapter_file, "-map_metadata", str(chapter_input_idx), "-map_chapters", str(chapter_input_idx)])
-        
-        # Add basic metadata
-        if meta.title:
-            meta_args.extend(["-metadata", f"title={meta.title}"])
-        meta_args.extend([
-            "-metadata", f"episode_id={meta.episode}",
-            "-metadata", f"show={safe_title}",
-        ])
-    
-    cmd = [
-        "ffmpeg",
-        "-allowed_extensions", "ALL",
-        "-i", local_m3u8_path,
-    ] + meta_args + [
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+faststart",
-        "-loglevel", "warning",
-        "-y",
-        out_file_abs,
-    ]
+    cmd = _build_ffmpeg_cmd(local_m3u8_path, part_file_abs, tmp_dir, safe_title, meta)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_dir)
+    except FileNotFoundError:
+        print(Fore.RED + "failed\n[error] ffmpeg not found - install it and add it to PATH"
+              + Fore.RESET)
+        return False
 
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_dir)
+    if result.returncode != 0:
+        print(Fore.RED + f"failed (code {result.returncode})" + Fore.RESET)
+        if result.stderr.strip():
+            print(Fore.RED + result.stderr.strip()[-2000:] + Fore.RESET)
+        _log_event("ffmpeg_failed", episode=ep_str, code=result.returncode,
+                   stderr=result.stderr.strip()[-2000:])
+        try:
+            os.remove(part_file_abs)
+        except OSError:
+            pass
+        return False  # temp dir kept -> next run skips straight to muxing
 
-    # Cleanup temp files (but keep state file for a bit in case of issues)
+    os.replace(part_file_abs, out_file_abs)
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    # Also clean up sidecar state file
-    state_path = tmp_dir + _STATE_FILE_SUFFIX
     try:
         os.remove(state_path)
     except OSError:
         pass
 
-    if result.returncode != 0:
-        print(Fore.RED + f"failed (code {result.returncode})" + Fore.RESET)
-        if result.stderr.strip():
-            print(Fore.RED + result.stderr.strip() + Fore.RESET)
-        _log_event("ffmpeg_failed", episode=ep_str, code=result.returncode, stderr=result.stderr.strip())
-    else:
-        try:
-            final_bytes = os.path.getsize(out_file_abs)
-            final_mb = final_bytes / (1024 * 1024)
-            wall_total = time.time() - start_wall
-            avg_speed = final_mb / wall_total if wall_total > 0.5 else 0.0
-            print(Fore.GREEN + "done" + Fore.RESET)
-            print(
-                Fore.GREEN + f"  Done -> .{os.sep}{out_file}  "
-                f"({final_mb:.1f} MB in {wall_total:.0f}s, avg {avg_speed:.2f} MB/s)" + Fore.RESET
-            )
-            _log_event("download_complete", episode=ep_str, output=out_file, 
-                      size_mb=final_mb, duration_s=wall_total, avg_speed_mbps=avg_speed)
-        except OSError:
-            print(Fore.GREEN + f"  Done -> .{os.sep}{out_file}" + Fore.RESET)
-            _log_event("download_complete", episode=ep_str, output=out_file)
+    final_mb = os.path.getsize(out_file_abs) / (1024 * 1024)
+    wall_total = time.time() - start_wall
+    print(Fore.GREEN + "done" + Fore.RESET)
+    print(Fore.GREEN + f"  Done -> {out_file}  ({final_mb:.1f} MB in {wall_total:.0f}s)" + Fore.RESET)
+    _log_event("download_complete", episode=ep_str, output=out_file,
+               size_mb=round(final_mb, 1), duration_s=round(wall_total))
+    return True

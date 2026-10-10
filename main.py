@@ -1,22 +1,38 @@
 """
-Anime downloader — animepahe
+main.py  —  Interactive CLI for the animepahe downloader.
 By Ashi and SeD  (revamped 2026)
 
-Requires either:
-  • nodriver (pip install nodriver) for automatic Cloudflare solving
-  • OR the ANIMEPAHE_CF_CLEARANCE environment variable set to your cf_clearance cookie
+Flow (each prompt accepts * to go back one step):
+  1. Enter an anime name      -> searches animepahe
+  2. Pick a result            -> fetches the full episode list
+  3. Choose episodes          -> scrapes each episode's download links
+  4. Choose a quality         -> resolves the kwik embed to an m3u8 stream
+                                 (add 'a', e.g. '2a', to reuse it for all episodes)
+  5. Download                 -> up to 6 episodes in parallel, saved as
+                                 <title>/<title> ep_NN.mp4 with cover art + chapters
+
+Module layout:
+  main.py     CLI prompts, navigation and batching (this file)
+  scraper.py  Cloudflare session, animepahe API, parallel HLS downloader
+  kwik.py     Extracts the m3u8 stream URL from kwik's obfuscated player
+
+Requirements:
+  • Python 3.10+ and ffmpeg on PATH
+  • Google Chrome, for automatic Cloudflare solving via nodriver (first run
+    opens a Chrome window for ~20-60s; the session is then cached for 3 hours)
+  • OR the ANIMEPAHE_CF_CLEARANCE env var set to your browser's cf_clearance cookie
 
 See README.md for setup instructions.
 
 Episode input examples:
   5          -> single episode
   1 3 7      -> episodes 1, 3 and 7
-  1-12       -> range
+  1-12       -> every episode from 1 to 12 (includes specials like 7.5)
   1-5 10 15  -> range + individual picks
-  5-         -> episode 5 to the last available
+  5-         -> episode 5 to the last available (asks for confirmation)
 
-Navigation:
-  Enter *    -> go back one step (or exit if at the start)
+Interrupted or failed episodes resume automatically — just run the same
+download again; finished episodes are skipped.
 
 Usage:
   python main.py              # Interactive mode
@@ -26,6 +42,7 @@ Usage:
 import argparse
 import asyncio
 import concurrent.futures
+import os
 import sys
 import time
 
@@ -33,7 +50,14 @@ from colorama import Fore, init
 
 import scraper
 from kwik import get_stream_url
-from scraper import EpisodeMeta  # for type hints
+
+# Anime titles can contain characters the console encoding can't show
+# (e.g. cp1252 on Windows) - print a placeholder instead of crashing.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 init(autoreset=True)
 
@@ -47,51 +71,38 @@ _GO_BACK = object()
 # === Helpers ===================================================================================================─
 
 def parse_episode_input(raw: str, available: set) -> list:
-    """Parse episode selection string. Supports 'x-' to mean x through last available."""
-    ep_in = []
-    max_available = max(float(x) for x in available)
+    """Parse an episode selection string into a sorted list of available episodes.
+
+    Tokens are separated by spaces:
+      5      -> episode 5
+      1-12   -> every available episode from 1 to 12 (includes specials like 7.5)
+      5-     -> episode 5 through the last available episode
+    Unknown episodes and malformed tokens are reported and skipped.
+    """
+    selected = set()
+    last_available = max(available)
 
     for token in raw.strip().split():
-        if "-" in token:
-            parts = token.split("-")
-            try:
-                start = float(parts[0])
-                # Open-ended range: "5-" means 5 through the last episode
-                end_str = parts[-1].strip()
-                if end_str == "":
-                    end = max_available
-                else:
-                    end = float(end_str)
-                # Generate sequence with step 1 for integer parts, or step for fractional
-                if start == int(start) and end == int(end):
-                    ep_in.extend(range(int(start), int(end) + 1))
-                else:
-                    # Handle fractional episodes with 0.5 step
-                    current = start
-                    while current <= end + 1e-9:  # small epsilon for float comparison
-                        ep_in.append(current)
-                        current += 1.0
-            except ValueError:
-                print(Fore.RED + f"[skip] bad range: {token}" + Fore.RESET)
-        else:
-            try:
+        try:
+            if "-" in token:
+                start_str, end_str = token.split("-", 1)
+                start = float(start_str)
+                end = float(end_str) if end_str.strip() else last_available
+                in_range = [ep for ep in available if start <= ep <= end]
+                if not in_range:
+                    print(Fore.YELLOW + f"[warn] no episodes in range {token}, skipping" + Fore.RESET)
+                selected.update(in_range)
+            else:
                 ep = float(token)
-                # Normalize: if it's a whole number, store as int for cleaner display
-                if ep == int(ep):
-                    ep = int(ep)
-                ep_in.append(ep)
-            except ValueError:
-                print(Fore.RED + f"[skip] bad token: {token}" + Fore.RESET)
+                ep = int(ep) if ep == int(ep) else ep
+                if ep in available:
+                    selected.add(ep)
+                else:
+                    print(Fore.YELLOW + f"[warn] episode {ep} not found, skipping" + Fore.RESET)
+        except ValueError:
+            print(Fore.RED + f"[skip] bad input: {token}" + Fore.RESET)
 
-    valid = []
-    # Convert available to floats for comparison
-    available_floats = set(float(x) for x in available)
-    for ep in sorted(set(ep_in)):
-        if ep in available_floats:
-            valid.append(ep)
-        else:
-            print(Fore.YELLOW + f"[warn] episode {ep} not found, skipping" + Fore.RESET)
-    return valid
+    return sorted(selected)
 
 
 def _check_cloudflare(resp):
@@ -103,14 +114,16 @@ def _check_cloudflare(resp):
               "  A) Install nodriver:  pip install nodriver  (automatic)\n"
               "  B) Open animepahe.pw in your browser, wait for it to load,\n"
               "     then copy the 'cf_clearance' cookie value and set:\n"
-              "     set ANIMEPAHE_CF_CLEARANCE=<your_cookie_value>" +
+              "       cmd:        set ANIMEPAHE_CF_CLEARANCE=<your_cookie_value>\n"
+              "       PowerShell: $env:ANIMEPAHE_CF_CLEARANCE=\"<your_cookie_value>\"\n"
+              "       Linux/mac:  export ANIMEPAHE_CF_CLEARANCE=<your_cookie_value>" +
               Fore.RESET)
         sys.exit(1)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="AnimePahe downloader — fetch & download anime episodes",
+        description="AnimePahe downloader - fetch & download anime episodes",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Episode format examples:
@@ -251,27 +264,29 @@ def _step_resolve_streams(ep_links: dict):
             quality_label = links[choice][1].strip() if len(links[choice]) > 1 else "?"
             print(Fore.WHITE + f"Using saved quality: {quality_label}" + Fore.RESET)
         else:
-            # Interactive selection
+            # Interactive selection (re-asks until the input is valid)
             prompt = "Choose quality"
             if remaining > 1:
                 prompt += " (add 'a' to apply to all remaining, e.g. '1a')"
             prompt += ": "
 
-            raw_choice = input(Fore.CYAN + prompt + Fore.RESET).strip()
+            while True:
+                raw_choice = input(Fore.CYAN + prompt + Fore.RESET).strip()
 
-            # Back navigation — go back to episode selection
-            if raw_choice == "*":
-                return _GO_BACK
+                # Back navigation — go back to episode selection
+                if raw_choice == "*":
+                    return _GO_BACK
 
-            apply_all = raw_choice.endswith("a") or raw_choice.endswith("A")
-            raw_choice = raw_choice.rstrip("aA").strip()
+                apply_all = raw_choice.lower().endswith("a")
+                raw_choice = raw_choice.rstrip("aA").strip()
 
-            try:
-                choice = int(raw_choice) - 1
-                _ = kwik_urls[choice]  # validate index
-            except (ValueError, IndexError):
-                print(Fore.RED + "Invalid choice, skipping." + Fore.RESET)
-                continue
+                try:
+                    choice = int(raw_choice) - 1
+                    if 0 <= choice < len(kwik_urls):
+                        break
+                except ValueError:
+                    pass
+                print(Fore.RED + f"Invalid choice, enter 1-{len(kwik_urls)}." + Fore.RESET)
 
             if apply_all:
                 print(Fore.GREEN + "Quality choice saved for remaining episodes [OK]" + Fore.RESET)
@@ -354,7 +369,7 @@ def _fetch_episode_links(anime_id: str, eps: dict, ep_list: list) -> dict:
 
         if attempt < _LINK_FETCH_MAX_RETRIES:
             print(Fore.YELLOW +
-                  f"[retry] {len(failed)} episode(s) hit rate limit — "
+                  f"[retry] {len(failed)} episode(s) hit rate limit - "
                   f"waiting {_LINK_FETCH_COOLDOWN}s before retry "
                   f"(round {attempt + 2}/{1 + _LINK_FETCH_MAX_RETRIES})..."
                   + Fore.RESET)
@@ -370,13 +385,13 @@ def _fetch_episode_links(anime_id: str, eps: dict, ep_list: list) -> dict:
 
 
 def _download_episodes(dl_queue: dict, title: str, output_dir: str | None,
-                        metadata: dict | None = None):
+                       metadata: dict | None = None):
     """Download all resolved episodes in batched parallel waves.
 
     Episodes are split into batches of up to MAX_PARALLEL (6).
     Each batch runs concurrently, and the next batch starts only after the
-    current one finishes.  This avoids CDN rate-limiting while still giving
-    full parallelism within each wave.
+    current one finishes. Segment requests from all episodes share one
+    connection cap (see scraper._cdn_slots), so the CDN isn't overloaded.
 
     Resume is always enabled — partially downloaded episodes are continued
     from where they left off.
@@ -386,84 +401,51 @@ def _download_episodes(dl_queue: dict, title: str, output_dir: str | None,
         sys.exit(1)
 
     total = len(dl_queue)
-    effective_parallel = min(total, MAX_PARALLEL)
+    batch_size = min(total, MAX_PARALLEL)
+    metadata = metadata or {}
 
     print(Fore.CYAN + f"\n{'='*40}" + Fore.RESET)
     print(Fore.CYAN + f"Downloading {total} episode(s)" +
-          (f" ({effective_parallel} parallel per batch)" if total > 1 else "") +
+          (f" ({batch_size} parallel per batch)" if total > 1 else "") +
           "..." + Fore.RESET)
+    if output_dir:
+        print(Fore.CYAN + f"Saving to: {os.path.abspath(output_dir)}" + Fore.RESET)
     print(Fore.CYAN + f"{'='*40}" + Fore.RESET)
 
-    # Avoid os.chdir in parallel mode - use absolute paths instead
-    if output_dir and total > 1:
-        import os
-        os.makedirs(output_dir, exist_ok=True)
-        chdir_needed = False
-    elif output_dir:
-        import os
-        orig_cwd = os.getcwd()
-        os.makedirs(output_dir, exist_ok=True)
-        os.chdir(output_dir)
-        chdir_needed = True
-    else:
-        chdir_needed = False
-
-    def _download_one(ep_m3u8_meta: tuple) -> tuple[int, bool]:
-        ep, m3u8, ep_meta = ep_m3u8_meta
+    def _download_one(ep) -> bool:
         try:
-            scraper.download_vid(m3u8, title, ep, meta=ep_meta, no_resume=False)
-            return ep, True
+            return scraper.download_vid(dl_queue[ep], title, ep, meta=metadata.get(ep),
+                                        output_dir=output_dir)
         except Exception as e:
             print(Fore.RED + f"[error] Episode {ep} failed: {e}" + Fore.RESET)
-            return ep, False
+            return False
 
-    episodes_to_download = [(ep, m3u8, metadata.get(ep) if metadata else None)
-                            for ep, m3u8 in dl_queue.items()]
-
+    episodes = list(dl_queue.keys())
+    batches = [episodes[i:i + batch_size] for i in range(0, total, batch_size)]
     failed_episodes = []
 
-    if total > 1:
-        # Split into batches of effective_parallel
-        batches = [episodes_to_download[i:i + effective_parallel]
-                   for i in range(0, len(episodes_to_download), effective_parallel)]
-        num_batches = len(batches)
+    for batch_idx, batch in enumerate(batches, 1):
+        if len(batches) > 1:
+            print(Fore.CYAN + f"\n>> Batch {batch_idx}/{len(batches)}  "
+                  f"episodes {batch}  ({len(batch)} parallel)" + Fore.RESET)
 
-        for batch_idx, batch in enumerate(batches, 1):
-            ep_nums = [item[0] for item in batch]
-            if num_batches > 1:
-                print(Fore.CYAN + f"\n>> Batch {batch_idx}/{num_batches}  "
-                      f"episodes {ep_nums}  ({len(batch)} parallel)" + Fore.RESET)
+        if len(batch) == 1:
+            results = {batch[0]: _download_one(batch[0])}  # no threading overhead
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                results = dict(zip(batch, executor.map(_download_one, batch)))
+        failed_episodes += [ep for ep, ok in results.items() if not ok]
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_parallel) as executor:
-                future_to_ep = {executor.submit(_download_one, item): item[0]
-                                for item in batch}
-                for future in concurrent.futures.as_completed(future_to_ep):
-                    ep, success = future.result()
-                    if not success:
-                        failed_episodes.append(ep)
-
-            if num_batches > 1:
-                done_so_far = sum(len(b) for b in batches[:batch_idx])
-                print(Fore.GREEN + f"[done] Batch {batch_idx}/{num_batches} complete  "
-                      f"({done_so_far}/{total} processed)" + Fore.RESET)
-    else:
-        # Single episode — no threading overhead
-        for ep, m3u8 in dl_queue.items():
-            ep_meta = metadata.get(ep) if metadata else None
-            try:
-                scraper.download_vid(m3u8, title, ep, meta=ep_meta, no_resume=False)
-            except Exception as e:
-                print(Fore.RED + f"[error] Episode {ep} failed: {e}" + Fore.RESET)
-                failed_episodes.append(ep)
-
-    if chdir_needed:
-        os.chdir(orig_cwd)
+        if len(batches) > 1:
+            done_so_far = sum(len(b) for b in batches[:batch_idx])
+            print(Fore.GREEN + f"[done] Batch {batch_idx}/{len(batches)} complete  "
+                  f"({done_so_far}/{total} processed)" + Fore.RESET)
 
     # Final summary
     succeeded = total - len(failed_episodes)
     if failed_episodes:
         print(Fore.YELLOW + f"\n[!] {len(failed_episodes)} episode(s) failed: "
-              f"{sorted(failed_episodes)}" + Fore.RESET)
+              f"{sorted(failed_episodes)} - run again to resume them" + Fore.RESET)
     print(Fore.GREEN + f"\nAll done!  ({succeeded}/{total} succeeded)" + Fore.RESET)
 
 
@@ -511,7 +493,7 @@ def main():
         elif step == 1:
             result = _step_select_anime(results)
             if result is _GO_BACK:
-                print(Fore.YELLOW + "← Back to search" + Fore.RESET)
+                print(Fore.YELLOW + "<- Back to search" + Fore.RESET)
                 step = 0
                 continue
             if result is None:
@@ -527,7 +509,7 @@ def main():
         elif step == 2:
             result = _step_select_episodes(eps, title)
             if result is _GO_BACK:
-                print(Fore.YELLOW + "← Back to anime selection" + Fore.RESET)
+                print(Fore.YELLOW + "<- Back to anime selection" + Fore.RESET)
                 step = 1
                 continue
             if result is None:
@@ -545,7 +527,7 @@ def main():
         elif step == 3:
             result = _step_resolve_streams(ep_links)
             if result is _GO_BACK:
-                print(Fore.YELLOW + "← Back to episode selection" + Fore.RESET)
+                print(Fore.YELLOW + "<- Back to episode selection" + Fore.RESET)
                 step = 2
                 continue
             dl_queue = result
@@ -556,11 +538,9 @@ def main():
 
         # ── Step 4: Download ──────────────────────────────────────────────
         elif step == 4:
-            # Fetch episode metadata for chapters & cover art
-            metadata = {}
-            if dl_queue:
-                print(Fore.WHITE + "\nFetching episode metadata..." + Fore.RESET)
-                metadata = scraper.fetch_all_episode_meta(anime_id, eps, ep_list)
+            # Episode metadata for cover art, title and chapters
+            # (parsed from the play pages already fetched in step 2)
+            metadata = scraper.fetch_all_episode_meta(anime_id, eps, list(dl_queue))
 
             _download_episodes(dl_queue, title, args.output_dir, metadata)
             break  # all done
