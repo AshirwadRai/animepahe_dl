@@ -240,6 +240,31 @@ def download_thumbnail(url: str, tmp_dir: str) -> str | None:
 # with 429s when hammered).
 _cdn_slots = threading.Semaphore(_DL_RATE_LIMIT)
 
+# Set on Ctrl+C so worker threads stop picking up new segments instead of
+# finishing the whole episode first.
+stop_event = threading.Event()
+
+
+def run_interruptible(fn, items: list, workers: int) -> list:
+    """Run fn over items in a thread pool and return the results in order.
+
+    On Ctrl+C, sets stop_event and cancels queued work rather than waiting
+    for every item. Waits in short slices because a blocking wait can't be
+    interrupted by Ctrl+C on Windows.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    futures = [executor.submit(fn, item) for item in items]
+    try:
+        pending = set(futures)
+        while pending:
+            _, pending = concurrent.futures.wait(pending, timeout=0.5)
+    except KeyboardInterrupt:
+        stop_event.set()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    return [f.result() for f in futures]
+
 
 @dataclass
 class SegmentState:
@@ -843,7 +868,8 @@ def show_dl_opts(links: list) -> list:
 # ── Filename sanitisation ─────────────────────────────────────────────────────
 
 def _sanitize(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', "", name).strip()
+    # Windows silently drops trailing dots/spaces from folder names
+    return re.sub(r'[\\/:*?"<>|]', "", name).strip(" .")
 
 
 # ── Parallel HLS downloader with resume & rate limiting ───────────────────────
@@ -1066,6 +1092,8 @@ def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/
         backoff = _DL_BASE_BACKOFF
 
         for attempt in range(1, _DL_MAX_RETRIES + 1):
+            if stop_event.is_set():
+                return False
             error = None
             wait = backoff
             try:
@@ -1081,8 +1109,11 @@ def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/
                     resp.raise_for_status()
                     if not resp.content:
                         raise IOError("empty segment")
-                    with open(seg_path, "wb") as f:
+                    # Write then rename, so an interrupted write never leaves a
+                    # truncated segment that resume would accept as complete
+                    with open(seg_path + ".tmp", "wb") as f:
                         f.write(resp.content)
+                    os.replace(seg_path + ".tmp", seg_path)
             except Exception as e:
                 error = str(e)
 
@@ -1099,7 +1130,7 @@ def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/
                 size_mb = total_bytes / (1024 * 1024)
                 speed = size_mb / elapsed if elapsed > 0.5 else 0.0
                 sys.stdout.write(
-                    f"\r  {Fore.WHITE}{done}/{total_segments} ({done / total_segments * 100:4.1f}%)  "
+                    f"\r  {Fore.WHITE}Ep {ep_str}: {done}/{total_segments} ({done / total_segments * 100:4.1f}%)  "
                     f"size= {size_mb:7.1f} MB  speed= {speed:5.2f} MB/s{Fore.RESET}"
                 )
                 sys.stdout.flush()
@@ -1108,7 +1139,7 @@ def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/
 
             seg_state.last_error = error
             if attempt < _DL_MAX_RETRIES:
-                time.sleep(wait + random.uniform(0, wait * _DL_JITTER))
+                stop_event.wait(wait + random.uniform(0, wait * _DL_JITTER))
                 backoff = min(backoff * 2, _DL_MAX_BACKOFF)
 
         _log_event("segment_failed", episode=ep_str, segment=seg_state.index,
@@ -1121,10 +1152,14 @@ def download_vid(m3u8_url: str, title: str, ep, referer: str = "https://kwik.cx/
     if remaining_segments:
         print(Fore.WHITE + f"  Downloading {len(remaining_segments)} segments "
               f"({_DL_WORKERS} workers)..." + Fore.RESET)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_DL_WORKERS) as executor:
-            list(executor.map(_download_segment, remaining_segments))
-        print()  # newline after the \r progress line
-    _save_state_throttled(force=True)
+        try:
+            run_interruptible(_download_segment, remaining_segments, _DL_WORKERS)
+        finally:
+            print()  # newline after the \r progress line
+            _save_state_throttled(force=True)
+
+    if stop_event.is_set():
+        return False  # interrupted - segments kept for resume
 
     # Every segment is needed - muxing with gaps would produce a broken video.
     # Downloaded segments stay in the temp dir, so a re-run only fetches the rest.

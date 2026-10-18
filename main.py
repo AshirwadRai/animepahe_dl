@@ -41,7 +41,6 @@ Usage:
 
 import argparse
 import asyncio
-import concurrent.futures
 import os
 import sys
 import time
@@ -147,8 +146,8 @@ Examples:
 
 # === Main flow ================================================================================================─
 
-def _search_anime(name: str) -> dict:
-    """Search for anime, with retries."""
+def _search_anime(name: str) -> dict | None:
+    """Search for anime, with retries. Returns None if nothing was found."""
     print(Fore.GREEN + "Searching..." + Fore.RESET)
     results = None
     last_err = None
@@ -166,11 +165,11 @@ def _search_anime(name: str) -> dict:
 
     if results is None:
         print(Fore.RED + f"Search failed after 3 attempts: {last_err}")
-        sys.exit(1)
+        return None
 
     if not results:
         print(Fore.RED + "No results found.")
-        sys.exit(1)
+        return None
     return results
 
 
@@ -258,12 +257,20 @@ def _step_resolve_streams(ep_links: dict):
 
         kwik_urls = scraper.show_dl_opts(links)
 
-        # Use saved quality if available
-        if saved_quality is not None and saved_quality < len(kwik_urls):
-            choice = saved_quality
-            quality_label = links[choice][1].strip() if len(links[choice]) > 1 else "?"
-            print(Fore.WHITE + f"Using saved quality: {quality_label}" + Fore.RESET)
-        else:
+        # Reuse the saved (quality, audio) pair - matched by label, not position,
+        # since episodes don't always list the same options in the same order
+        choice = None
+        if saved_quality is not None:
+            choice = next((n for n, link in enumerate(links)
+                           if tuple(link[1:3]) == saved_quality), None)
+            label = " ".join(filter(None, saved_quality))
+            if choice is not None:
+                print(Fore.WHITE + f"Using saved quality: {label}" + Fore.RESET)
+            else:
+                print(Fore.YELLOW + f"Saved quality ({label}) not offered for this episode."
+                      + Fore.RESET)
+
+        if choice is None:
             # Interactive selection (re-asks until the input is valid)
             prompt = "Choose quality"
             if remaining > 1:
@@ -290,11 +297,15 @@ def _step_resolve_streams(ep_links: dict):
 
             if apply_all:
                 print(Fore.GREEN + "Quality choice saved for remaining episodes [OK]" + Fore.RESET)
-                saved_quality = choice
+                saved_quality = tuple(links[choice][1:3])
 
         kwik_url = links[choice][0]
         print(Fore.WHITE + "Resolving stream URL..." + Fore.RESET)
-        m3u8 = get_stream_url(kwik_url)
+        try:
+            m3u8 = get_stream_url(kwik_url)
+        except Exception as e:
+            print(Fore.RED + f"[kwik] request failed: {e}" + Fore.RESET)
+            m3u8 = None
         if not m3u8:
             print(Fore.RED + f"[skip] could not resolve stream for ep {ep}" + Fore.RESET)
             continue
@@ -432,8 +443,7 @@ def _download_episodes(dl_queue: dict, title: str, output_dir: str | None,
         if len(batch) == 1:
             results = {batch[0]: _download_one(batch[0])}  # no threading overhead
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                results = dict(zip(batch, executor.map(_download_one, batch)))
+            results = dict(zip(batch, scraper.run_interruptible(_download_one, batch, len(batch))))
         failed_episodes += [ep for ep, ok in results.items() if not ok]
 
         if len(batches) > 1:
@@ -487,7 +497,8 @@ def main():
                 continue  # retry (empty input)
             name = result
             results = _search_anime(name)
-            step = 1
+            if results:
+                step = 1
 
         # ── Step 1: Pick anime from results ───────────────────────────────
         elif step == 1:
@@ -547,4 +558,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + "\n\nInterrupted. Unfinished episodes resume if you run "
+              "the same download again." + Fore.RESET)
+        sys.exit(130)

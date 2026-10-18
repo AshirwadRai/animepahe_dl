@@ -25,7 +25,7 @@ def _base_url():
 
 
 def _get(url: str, **kwargs):
-    time.sleep(REQUEST_DELAY)
+    """GET with the shared session, retrying network errors and 429/5xx."""
     headers = {
         "User-Agent": _scraper._user_agent,  # always read fresh (may be updated by nodriver)
         "Referer": kwargs.pop("referer", f"{_base_url()}/"),
@@ -33,7 +33,21 @@ def _get(url: str, **kwargs):
         "Accept-Language": "en-US,en;q=0.5",
         "Accept-Encoding": "gzip, deflate",
     }
-    return _session.get(url, headers=headers, timeout=30, **kwargs)
+    wait = REQUEST_DELAY
+    for attempt in range(_scraper._RETRY_TOTAL + 1):
+        time.sleep(wait)
+        last_try = attempt == _scraper._RETRY_TOTAL
+        try:
+            resp = _session.get(url, headers=headers, timeout=30, **kwargs)
+        except Exception:
+            if last_try:
+                raise
+            wait = _scraper._RETRY_BACKOFF * (2 ** attempt)
+            continue
+        if resp.status_code not in _scraper._RETRY_STATUS_CODES or last_try:
+            return resp
+        base = _scraper._RETRY_429_BASE_BACKOFF if resp.status_code == 429 else _scraper._RETRY_BACKOFF
+        wait = base * (2 ** attempt)
 
 
 def _unpack_payloads(html: str) -> list[str]:
